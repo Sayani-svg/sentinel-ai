@@ -1,14 +1,22 @@
-"""Database engine and session factory for Sentinel AI."""
+"""Database engine and session factory for Sentinel AI.
+
+The FastAPI ``get_db`` dependency is *not* defined here. It is re-exported from
+:mod:`app.core.dependencies`, which is where routers and tests reference it, so
+that ``app.database.get_db`` and ``app.core.dependencies.get_db`` are the same
+function object rather than two implementations that have to be kept in step.
+Two copies is how a test ends up overriding the dependency the router does not
+use, and silently keeps the production engine out of reach of the suite instead
+of in reach of it.
+"""
 
 from __future__ import annotations
-
-from collections.abc import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings, get_settings
+from app.core.dependencies import get_db as get_db
 
 
 def create_database_engine(settings: Settings) -> Engine:
@@ -43,19 +51,3 @@ SessionLocal: sessionmaker[Session] = sessionmaker(
     autoflush=False,
     bind=engine,
 )
-
-
-def get_db() -> Generator[Session, None, None]:
-    """Yield a database session and close it after the caller finishes.
-
-    The lifecycle matches the FastAPI ``get_db`` dependency: open a session
-    from ``SessionLocal``, yield it to the caller, then close it.
-
-    Yields:
-        Session: A SQLAlchemy ORM session bound to the application engine.
-    """
-    db: Session = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

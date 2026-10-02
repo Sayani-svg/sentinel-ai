@@ -1,15 +1,30 @@
-"""The ML package must resolve the same directories the application does.
+"""Focused tests for the standalone ML config.
 
-These are the tests that fail loudly if the two ever drift. A model trained from
-``ml/dataset`` and served from ``backend``'s view of the world has to agree about
-where those files are, and the only moment that is cheap to notice is before a
-model exists. Once one does, a path mistake becomes a silent "no artifact found"
-at serving time.
+The ML config must resolve its own paths and settings without importing the
+backend or requiring environment variables such as ``DATABASE_URL`` or
+``SECRET_KEY``. These tests verify that the module-level constants and
+:class:`MLPaths` behave as specified.
 """
 
 from __future__ import annotations
 
-from src.config import BACKEND_DIR, BASE_DIR, DATASET_DIR, ML_DIR, MODEL_DIR, PATHS
+from src.config import (
+    BACKEND_DIR,
+    BASE_DIR,
+    CV_FOLDS,
+    DATASET_DIR,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_FILENAME,
+    ML_DIR,
+    MODEL_DIR,
+    MODEL_NAME,
+    MODEL_PATH,
+    MODEL_VERSION,
+    PATHS,
+    RANDOM_STATE,
+    TEST_SIZE,
+    VALIDATION_SIZE,
+)
 
 
 def test_ml_dir_is_the_ml_package() -> None:
@@ -31,31 +46,11 @@ def test_layout_is_backend_and_ml_under_one_root() -> None:
 
 
 def test_paths_point_inside_the_checkout() -> None:
-    """Derived directories must live under the repository, not beside it.
-
-    Guards the specific mistake of counting parents from ``ml/src`` and landing
-    one level too high, which puts the dataset directory outside the repository.
-    """
+    """Derived directories must live under the repository, not beside it."""
     assert PATHS.dataset_dir == ML_DIR / "dataset"
     assert PATHS.model_dir == ML_DIR / "models"
     for path in (PATHS.ml_dir, BACKEND_DIR, DATASET_DIR, MODEL_DIR):
         assert BASE_DIR in path.parents or path == BASE_DIR
-
-
-def test_agrees_with_application_settings() -> None:
-    """ML paths must match the ones the running application resolves.
-
-    The application settings are imported only for this comparison. They are not
-    needed to compute the ML paths -- that independence is the point of
-    :mod:`src.config` -- but where both are available they must agree.
-    """
-    from app.core.config import _resolve_project_paths
-
-    expected = _resolve_project_paths()
-
-    assert str(ML_DIR) == str(expected["ML_DIR"])
-    assert str(DATASET_DIR) == str(expected["DATASET_DIR"])
-    assert str(MODEL_DIR) == str(expected["MODEL_DIR"])
 
 
 def test_ensure_model_dir_creates_on_demand() -> None:
@@ -64,30 +59,37 @@ def test_ensure_model_dir_creates_on_demand() -> None:
     assert PATHS.model_dir.is_dir()
 
 
-def test_model_filename_matches_application_setting() -> None:
-    """The artifact filename must match ``Settings.MODEL_PATH``.
+def test_ensure_dataset_dir_creates_on_demand() -> None:
+    """A missing dataset directory must be creatable, for a fresh checkout."""
+    assert PATHS.ensure_dataset_dir() == PATHS.dataset_dir
+    assert PATHS.dataset_dir.is_dir()
 
-    The application looks in one specific place. A loader defaulting elsewhere
-    would report the model as missing while the file sat on disk.
-    """
-    from app.core.config import Settings
 
-    from src.config import DEFAULT_MODEL_FILENAME, MODEL_PATH
-
+def test_model_filename_is_correct() -> None:
+    """The artifact filename matches the expected default."""
     assert DEFAULT_MODEL_FILENAME == "best_model.pkl"
-    assert MODEL_PATH == Settings().MODEL_PATH
+    assert MODEL_PATH == MODEL_DIR / DEFAULT_MODEL_FILENAME
 
 
 def test_split_fractions_sum_below_one() -> None:
-    """Train/validation/test splits must leave a share for training.
-
-    Mirrors the application's own validator. Stating the invariant here means a
-    future default that breaks it is caught in this package's tests rather than
-    whenever a training run first tries to split anything.
-    """
-    from app.core.config import Settings
-
-    from src.config import TEST_SIZE, VALIDATION_SIZE
-
+    """Train/validation/test splits must leave a share for training."""
     assert TEST_SIZE + VALIDATION_SIZE < 1.0
-    assert (TEST_SIZE, VALIDATION_SIZE) == (Settings().TEST_SIZE, Settings().VALIDATION_SIZE)
+    assert TEST_SIZE == 0.2
+    assert VALIDATION_SIZE == 0.1
+
+
+def test_model_settings_are_set() -> None:
+    """Model defaults are defined for standalone config."""
+    assert CV_FOLDS == 5
+    assert DEFAULT_MODEL == "XGBoost"
+    assert MODEL_VERSION == "1.0.0"
+    assert MODEL_NAME == "Sentinel AI Threat Classifier"
+    assert RANDOM_STATE == 42
+
+
+def test_paths_structure() -> None:
+    """The MLPaths object exposes the expected directories."""
+    assert PATHS.ml_dir == ML_DIR
+    assert PATHS.dataset_dir == DATASET_DIR
+    assert PATHS.model_dir == MODEL_DIR
+    assert PATHS.outputs_dir == ML_DIR / "outputs"

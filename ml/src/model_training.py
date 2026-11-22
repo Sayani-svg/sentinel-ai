@@ -13,20 +13,22 @@ not a stub or a placeholder: it is the behaviour the application has today, and
 it stays the fallback in :mod:`src.inference` for as long as no artifact exists.
 
 :class:`TrainingRequest` and :class:`TrainingRun` describe what a training run is
-and what it must leave behind. No run is performed here. There is no benchmark in
-``ml/dataset`` and no scientific Python stack installed, and a training function
-that manufactured its own inputs would report an accuracy describing the
-manufacture. :func:`train_classifier` says so in a typed error instead.
+and what it must leave behind. :func:`train_classifier` fits a deterministic
+scikit-learn RandomForest against a supplied validated dataset. It never
+fabricates rows: an empty dataset is refused, and a caller asking for a model
+this build does not implement is told so with a typed error.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Final
 
+import numpy as np
 from app.schemas.prediction import AttackType
 from app.services.prediction_service import (
     AttackDetection,
@@ -34,14 +36,19 @@ from app.services.prediction_service import (
     detect_attack,
 )
 
-from src.config import MODEL_VERSION, RANDOM_STATE
-from src.dataset_validation import TrainingDataset
+from src.config import MODEL_VERSION, RANDOM_FOREST_MODEL, RANDOM_STATE
+from src.dataset_validation import TrainingDataset, require_complete_dataset
 from src.feature_engineering import feature_names
+from src.preprocessing import CLASS_COUNT, TRAINABLE_ATTACK_TYPES, label_to_index
 
 #: Confidence below which a trained model is not trusted to answer alone, and the
 #: rule-based detector decides instead. Stated once so the threshold can be tuned
 #: without hunting through the selection logic.
 MODEL_CONFIDENCE_FLOOR: Final[float] = 0.5
+
+#: Fixed forest size. Deliberately not tuned: this milestone establishes the
+#: training path, not a model-selection result.
+RANDOM_FOREST_TREES: Final[int] = 200
 
 
 class ClassifierSource(StrEnum):
@@ -75,7 +82,57 @@ class TrainingDataUnavailableError(TrainingError):
 
 
 class EstimatorUnavailableError(TrainingError):
-    """Raised when no estimator implementation is wired up yet."""
+    """Raised when the requested estimator is not implemented here."""
+
+
+def _class_code(value: object) -> int:
+    """Map a fitted estimator's class label to a Sentinel class code."""
+    if isinstance(value, (int, np.integer)):
+        code = int(value)
+    elif isinstance(value, AttackType):
+        code = label_to_index(value)
+    elif isinstance(value, str):
+        code = label_to_index(value)
+    else:
+        raise TrainingError(f"An estimator returned an unknown class {value!r}.")
+    if not 0 <= code < CLASS_COUNT:
+        raise TrainingError(f"Class code {code} is outside the trainable vocabulary.")
+    return code
+
+
+class _AlignedEstimator:
+    """Expose one probability column per trainable class, in code order.
+
+    A forest fitted on a dataset that lacks some classes reports only the
+    classes it saw. Artifact metadata, however, promises a column per trainable
+    class. This adapter keeps that promise by placing each returned column at
+    its code position and zero-filling absent classes.
+    """
+
+    def __init__(
+        self, estimator: object, present_codes: Sequence[int]
+    ) -> None:
+        self._estimator = estimator
+        self.classes_ = TRAINABLE_ATTACK_TYPES
+        declared = getattr(estimator, "classes_", None)
+        self._source_codes = (
+            tuple(present_codes) if declared is None else tuple(_class_code(v) for v in declared)
+        )
+
+    def predict_proba(self, features: Sequence[Sequence[float]]) -> np.ndarray:
+        """Return full-width probabilities in trainable-class code order."""
+        probabilities = np.asarray(self._estimator.predict_proba(features), dtype=float)
+        if probabilities.ndim != 2:
+            raise TrainingError("An estimator returned a non-matrix probability array.")
+        if probabilities.shape[1] != len(self._source_codes):
+            raise TrainingError(
+                f"An estimator returned {probabilities.shape[1]} probability "
+                f"column(s) for {len(self._source_codes)} declared class(es)."
+            )
+        aligned = np.zeros((probabilities.shape[0], CLASS_COUNT), dtype=float)
+        for column, code in enumerate(self._source_codes):
+            aligned[:, code] = probabilities[:, column]
+        return aligned
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +169,8 @@ class TrainingRequest:
         random_state: Seed for the split and the estimator, matching
             ``Settings.RANDOM_STATE``.
         version: Version label for the resulting artifact.
+        allow_incomplete_dataset: Explicit opt-in for a dataset that was only
+            partially loaded from its sources.
     """
 
     dataset: TrainingDataset
@@ -119,6 +178,7 @@ class TrainingRequest:
     feature_order: tuple[str, ...] = field(default_factory=feature_names)
     random_state: int = RANDOM_STATE
     version: str = MODEL_VERSION
+    allow_incomplete_dataset: bool = False
 
     def validate(self) -> None:
         """Check the request can produce a model.
@@ -126,7 +186,12 @@ class TrainingRequest:
         Raises:
             TrainingError: If the dataset is empty, names no usable feature, or
                 the feature order disagrees with the dataset's own.
+            src.dataset_validation.IncompleteDatasetError: If the dataset was
+                partially loaded without the explicit opt-in.
         """
+        require_complete_dataset(
+            self.dataset, allow_incomplete=self.allow_incomplete_dataset
+        )
         if not len(self.dataset):
             raise TrainingDataUnavailableError("The training request holds no rows.")
         if self.dataset.feature_order != self.feature_order:
@@ -154,6 +219,8 @@ class TrainingRun:
         rows_trained: Rows the run consumed.
         class_counts: Rows per class at training time.
         trained_at: When the run finished.
+        dataset_complete: Whether the source load was complete.
+        incomplete_reasons: Explanations retained when the load was incomplete.
     """
 
     model_name: str
@@ -163,6 +230,8 @@ class TrainingRun:
     rows_trained: int
     class_counts: dict[AttackType, int]
     trained_at: datetime
+    dataset_complete: bool = True
+    incomplete_reasons: tuple[str, ...] = ()
 
 
 class Classifier(ABC):
@@ -254,10 +323,10 @@ class RuleBasedClassifier(Classifier):
 
 
 def build_training_run(request: TrainingRequest, *, trained_at: datetime) -> TrainingRun:
-    """Describe the artifact a completed run would leave behind.
+    """Describe the artifact a completed run leaves behind.
 
-    Separated from any actual fitting so the shape of a run's metadata is settled
-    and testable while the estimator is still unwritten.
+    Separated from fitting so the shape of a run's metadata is settled and
+    testable independently of the estimator.
 
     Args:
         request: The validated request describing the run.
@@ -278,6 +347,8 @@ def build_training_run(request: TrainingRequest, *, trained_at: datetime) -> Tra
         rows_trained=len(request.dataset),
         class_counts=dict(request.dataset.class_counts),
         trained_at=trained_at,
+        dataset_complete=request.dataset.completeness.complete,
+        incomplete_reasons=request.dataset.completeness.reasons,
     )
 
 
@@ -299,39 +370,69 @@ def _declared_classes(dataset: TrainingDataset) -> tuple[AttackType, ...]:
 def train_classifier(
     request: TrainingRequest, estimator: object | None = None
 ) -> tuple[Classifier, TrainingRun]:
-    """Fit a classifier from a validated dataset.
-
-    Refused in this build, with a typed error, rather than quietly doing nothing.
-    Two things are missing and neither is a code change: a real benchmark in
-    ``ml/dataset``, and a scientific Python stack to fit an estimator with. The
-    request is still validated first, so a caller learns immediately whether its
-    *data* is usable even before an estimator exists.
+    """Fit a deterministic classifier from a validated dataset.
 
     Args:
         request: The run to perform.
-        estimator: A fitted-or-fittable estimator. Unused in this build; present
-            so the signature does not have to change when one is wired up.
+        estimator: Optional fittable estimator, mainly for tests. When omitted,
+            a fixed-scikit-learn RandomForest is created.
 
     Returns:
         tuple[Classifier, TrainingRun]: The fitted classifier and its metadata.
 
     Raises:
-        TrainingError: If the request does not validate, no real dataset was
-            supplied, or no estimator implementation is available.
+        TrainingError: If the request does not validate or fitting fails.
+        TrainingDataUnavailableError: If the dataset holds no rows.
+        EstimatorUnavailableError: If the requested model is not implemented.
     """
     request.validate()
 
     if not len(request.dataset):
         raise TrainingDataUnavailableError(
-            f"The dataset holds no rows. Training needs a real benchmark in the "
-            f"dataset directory; this package will not generate one."
+            "The dataset holds no rows. Training needs a real benchmark in the "
+            "dataset directory; this package will not generate one."
+        )
+    if request.model_name != RANDOM_FOREST_MODEL:
+        raise EstimatorUnavailableError(
+            f"No estimator is wired up for {request.model_name!r}. This build "
+            f"trains {RANDOM_FOREST_MODEL!r}; the rule-based detector remains "
+            "the fallback for every other model name."
         )
 
-    raise EstimatorUnavailableError(
-        f"No estimator is wired up for {request.model_name!r}. Install the "
-        "scientific Python stack and provide a real dataset before training. "
-        "The application continues to classify with the rule-based detector, so "
-        "no feature is lost by leaving this unimplemented."
+    if estimator is None:
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+        except ImportError as exc:
+            raise EstimatorUnavailableError(
+                "scikit-learn is required to fit the RandomForest estimator."
+            ) from exc
+        estimator = RandomForestClassifier(
+            n_estimators=RANDOM_FOREST_TREES,
+            random_state=request.random_state,
+            class_weight="balanced",
+            n_jobs=1,
+        )
+
+    features = request.dataset.feature_matrix
+    codes = request.dataset.label_codes
+    estimator.fit(features, codes)
+    present_codes = tuple(int(code) for code in np.unique(codes))
+    aligned = _AlignedEstimator(estimator, present_codes)
+
+    from src.inference import ArtifactMetadata, ModelArtifact, ModelClassifier
+
+    artifact = ModelArtifact(
+        estimator=aligned,
+        metadata=ArtifactMetadata(
+            model_name=request.model_name,
+            version=request.version,
+            feature_order=request.feature_order,
+            classes=TRAINABLE_ATTACK_TYPES,
+        ),
+    )
+    artifact.validate()
+    return ModelClassifier(artifact), build_training_run(
+        request, trained_at=datetime.now(timezone.utc)
     )
 
 

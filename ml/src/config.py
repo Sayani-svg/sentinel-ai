@@ -60,10 +60,12 @@ TEST_SIZE: Final[float] = 0.2
 CV_FOLDS: Final[int] = 5
 
 #: Estimator identifier used when a caller states none, matching
-#: ``Settings.DEFAULT_MODEL``. Not a claim that this estimator is available: no
-#: scientific stack is installed, so :func:`src.model_training.train_classifier`
-#: refuses until one is.
+#: ``Settings.DEFAULT_MODEL``. The configured application default stays as
+#: declared; the training entry point currently implements RandomForest only.
 DEFAULT_MODEL: Final[str] = "XGBoost"
+
+#: Estimator identifier this build can actually fit with scikit-learn.
+RANDOM_FOREST_MODEL: Final[str] = "RandomForest"
 
 #: Version label for the active artifact, matching ``Settings.MODEL_VERSION``.
 MODEL_VERSION: Final[str] = "1.0.0"

@@ -9,21 +9,26 @@ either trains on nonsense or reports a confidence it has not earned.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
+import numpy as np
 import pytest
 from app.schemas.prediction import AttackType
 
 from src.dataset_validation import (
+    DatasetStorage,
     DatasetValidationError,
     EmptyDatasetError,
     InsufficientClassCoverageError,
     LabeledExample,
     MissingFeatureError,
     NonFiniteFeatureError,
+    TrainingDataset,
     UnknownLabelError,
     dataset_from_records,
     describe_dataset,
     describe_schema,
+    validate_arrays,
     validate_examples,
 )
 from src.feature_engineering import feature_names
@@ -244,3 +249,102 @@ def test_examples_are_immutable() -> None:
     example = LabeledExample(features=_vector(), label=AttackType.BENIGN)
     with pytest.raises(AttributeError):
         example.label = AttackType.DOS  # type: ignore[misc]
+
+
+def test_validated_dataset_stores_compact_arrays() -> None:
+    """Rows must be stored once as numeric arrays, not as per-example objects."""
+    dataset = _dataset()
+
+    assert dataset.feature_matrix.dtype == np.float32
+    assert dataset.feature_matrix.shape == (2, len(feature_names()))
+    assert dataset.label_codes.dtype == np.uint8
+    assert dataset.storage is DatasetStorage.MEMORY
+
+
+def test_arrays_can_be_validated_directly() -> None:
+    """A streaming reader must be able to build a dataset without Python rows."""
+    features = np.full((2, len(feature_names())), 3.0, dtype=np.float32)
+    codes = np.array([0, 1], dtype=np.uint8)
+
+    dataset = validate_arrays(features, codes, feature_names())
+
+    assert len(dataset) == 2
+    assert dataset.labels == (AttackType.BENIGN, AttackType.DOS)
+    assert dataset.examples[0].features == _vector(3.0)
+
+
+def test_disk_backed_dataset_preserves_the_row_contract(tmp_path: Path) -> None:
+    """Memory-mapped arrays must look identical to resident arrays for callers."""
+    dataset = _dataset().to_disk(tmp_path, name="checkpoint")
+
+    assert dataset.storage is DatasetStorage.DISK
+    assert len(dataset.storage_paths) == 2
+    assert all(path.exists() for path in dataset.storage_paths)
+    assert dataset.examples[0].features == _vector(1.0)
+    assert dataset.examples[1].features == _vector(2.0)
+
+
+def test_concat_combines_arrays_without_materialising_examples(tmp_path: Path) -> None:
+    """Several validated batches must form one compact dataset."""
+    first = _dataset()
+    second = dataset_from_records(
+        [(_vector(1.0), AttackType.BENIGN), (_vector(2.0), AttackType.DOS)]
+    )
+
+    combined = TrainingDataset.concat(
+        [first, second], storage=DatasetStorage.DISK, storage_dir=tmp_path
+    )
+
+    assert len(combined) == 4
+    assert combined.feature_matrix.shape == (4, len(feature_names()))
+    assert combined.class_counts == {AttackType.BENIGN: 2, AttackType.DOS: 2}
+    assert combined.storage is DatasetStorage.DISK
+
+
+def test_noncanonical_feature_order_is_refused() -> None:
+    """Five columns are not enough: the names and their order are the contract."""
+    features = np.full((2, len(feature_names())), 3.0, dtype=np.float32)
+    codes = np.array([0, 1], dtype=np.uint8)
+
+    with pytest.raises(MissingFeatureError, match="canonical"):
+        validate_arrays(features, codes, tuple(reversed(feature_names())))
+
+
+def test_validated_arrays_are_read_only_copies() -> None:
+    """Validation must not hand callers a mutable alias to its invariants."""
+    features = np.full((2, len(feature_names())), 3.0, dtype=np.float32)
+    codes = np.array([0, 1], dtype=np.uint8)
+
+    dataset = validate_arrays(features, codes, feature_names())
+    features[0, 0] = 99.0
+    codes[0] = 7
+
+    assert dataset.feature_matrix[0, 0] == 3.0
+    assert dataset.label_codes[0] == 0
+    assert not dataset.feature_matrix.flags.writeable
+    assert not dataset.label_codes.flags.writeable
+    with pytest.raises(ValueError):
+        dataset.feature_matrix[0, 0] = 1.0
+
+
+def test_lazy_examples_preserve_tuple_behavior() -> None:
+    """The compact view must still compare and hash like the old tuple."""
+    dataset = _dataset()
+    expected = tuple(dataset.examples)
+
+    assert dataset.examples == expected
+    assert hash(dataset.examples) == hash(expected)
+    assert repr(dataset.examples) == repr(expected)
+    assert dataset.examples[1:] == expected[1:]
+
+
+def test_cleanup_removes_every_dataset_file(tmp_path: Path) -> None:
+    """A disk-backed dataset must know how to remove its own files."""
+    dataset = _dataset().to_disk(tmp_path, name="checkpoint")
+    paths = dataset.storage_paths
+    assert all(path.exists() for path in paths)
+
+    dataset.cleanup()
+
+    assert not any(path.exists() for path in paths)
+    assert not list(tmp_path.glob(".*checkpoint*"))

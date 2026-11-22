@@ -1,11 +1,10 @@
 """Serving: loading a trained artifact, and falling back to the rules when there isn't one.
 
-Nothing here loads a model today. :func:`load_artifact` refuses, with a typed
-error naming the path it looked at, because ``ml/models`` holds only a
-``.gitkeep`` and no serializer is installed. An empty ``best_model.pkl`` -- a
-zero-byte placeholder, or a pickle of ``None`` -- would be worse than absent,
-because its presence would satisfy a presence check and the application would
-silently serve nothing.
+:func:`load_artifact` delegates to :mod:`src.model_export`, which reads a joblib
+artifact and validates its metadata before it reaches the serving path. An empty
+``best_model.pkl`` -- a zero-byte placeholder, or a pickle of ``None`` -- is
+still worse than absent, because its presence would satisfy a presence check and
+the application would silently serve nothing.
 
 **The fallback is observable.** :class:`FallbackClassifier` tries the model and
 defers to the rules when the model is unavailable or not confident enough, and
@@ -74,7 +73,7 @@ class ModelArtifactUnavailableError(InferenceError):
 
 
 class SerializationUnavailableError(ModelArtifactUnavailableError):
-    """Raised when no serializer is available to read an artifact."""
+    """Raised when joblib is required but unavailable in this environment."""
 
 
 class ArtifactContractError(InferenceError):
@@ -401,10 +400,9 @@ class FallbackClassifier(Classifier):
 
 
 def load_artifact(path: Path | None = None) -> ModelArtifact:
-    """Load a serialized artifact from disk.
+    """Load and validate a joblib artifact from disk.
 
-    Refused in this build. No artifact exists and no serializer is installed, so
-    rather than returning ``None`` -- which a caller could mistake for "no model
+    Rather than returning ``None`` -- which a caller could mistake for "no model
     available, use the rules" and skip -- this raises a typed error naming the
     path. :func:`select_classifier` is the entry point that turns absence into a
     fallback instead of an exception.
@@ -416,31 +414,23 @@ def load_artifact(path: Path | None = None) -> ModelArtifact:
         ModelArtifact: The loaded artifact.
 
     Raises:
-        ModelArtifactUnavailableError: If the file is absent or empty.
-        SerializationUnavailableError: If a file is present but no serializer is
-            available to read it.
+        ModelArtifactUnavailableError: If the file is absent, empty or unreadable.
+        ArtifactContractError: If the file's metadata fails validation.
+        SerializationUnavailableError: If joblib is not installed.
     """
     resolved = MODEL_PATH if path is None else path
 
-    if not resolved.exists():
-        raise ModelArtifactUnavailableError(
-            resolved, "the file does not exist."
-        )
-    if resolved.is_dir():
-        raise ModelArtifactUnavailableError(resolved, "the path is a directory.")
-    if resolved.stat().st_size == 0:
-        raise ModelArtifactUnavailableError(
+    try:
+        from src.model_export import load_artifact as load_serialized_artifact
+    except ModuleNotFoundError as exc:
+        if exc.name != "joblib":
+            raise
+        raise SerializationUnavailableError(
             resolved,
-            "the file is empty, which means a placeholder was written where an "
-            "artifact was expected.",
-        )
+            "joblib is required to read a trained model artifact and is not installed.",
+        ) from exc
 
-    raise SerializationUnavailableError(
-        resolved,
-        "reading an artifact needs a serializer such as joblib or pickle, and "
-        "none is installed. The scientific Python stack must be installed "
-        "before a trained model can be served.",
-    )
+    return load_serialized_artifact(resolved)
 
 
 def select_classifier(

@@ -1,25 +1,32 @@
-"""The classifier contract, and the refusal to train on nothing.
+"""The classifier contract, its refusals, and the real RandomForest path.
 
 The rule-based wrapper is the behaviour the application has today, so these tests
 pin two things: that wrapping it changed nothing about the verdicts, and that the
-provenance stamp is now attached. The training tests pin the *refusals* -- a
-training entry point that quietly did nothing would be indistinguishable, from a
-run log, from one that produced a model.
+provenance stamp is now attached. The training tests pin the refusals as well as
+a deterministic scikit-learn fit, so a run log cannot confuse a no-op with a
+model.
 """
 
 from __future__ import annotations
 
 import io
 from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 import pytest
 from app.schemas.prediction import AttackType
 from app.services.log_parser import parse_csv_log
 from app.services.prediction_service import DetectionInput, detect_attack
 
-from src.config import DEFAULT_MODEL, MODEL_VERSION
-from src.dataset_validation import dataset_from_records
+from src.config import DEFAULT_MODEL, MODEL_VERSION, RANDOM_FOREST_MODEL
+from src.dataset_validation import (
+    DatasetCompleteness,
+    IncompleteDatasetError,
+    dataset_from_records,
+)
 from src.feature_engineering import feature_names, to_feature_space
+from src.preprocessing import CLASS_COUNT, TRAINABLE_ATTACK_TYPES
 from src.model_training import (
     MODEL_CONFIDENCE_FLOOR,
     Classifier,
@@ -181,6 +188,47 @@ def test_request_with_mismatched_feature_order_is_refused() -> None:
         request.validate()
 
 
+def _incomplete_dataset():
+    """Return a valid dataset explicitly marked as a partial source load."""
+    width = len(feature_names())
+    return dataset_from_records(
+        [
+            ((1.0,) * width, AttackType.BENIGN),
+            ((2.0,) * width, AttackType.DOS),
+        ],
+        completeness=DatasetCompleteness(
+            complete=False,
+            truncated_paths=(Path("day1.csv"),),
+            reasons=("day1.csv exceeded the backend parser row cap and was truncated.",),
+        ),
+    )
+
+
+def test_incomplete_dataset_is_refused_by_default() -> None:
+    """An incomplete source load must not reach an estimator silently."""
+    request = TrainingRequest(dataset=_incomplete_dataset(), model_name=DEFAULT_MODEL)
+
+    with pytest.raises(IncompleteDatasetError) as excinfo:
+        request.validate()
+    assert "allow_incomplete_dataset=True" in str(excinfo.value)
+    assert "day1.csv" in str(excinfo.value)
+
+
+def test_incomplete_dataset_opt_in_is_explicit() -> None:
+    """The opt-in must be named, and its use recorded on the run metadata."""
+    dataset = _incomplete_dataset()
+    request = TrainingRequest(
+        dataset=dataset, model_name=DEFAULT_MODEL, allow_incomplete_dataset=True
+    )
+
+    request.validate()
+    run = build_training_run(request, trained_at=datetime(2026, 1, 1))
+
+    assert run.dataset_complete is False
+    assert run.incomplete_reasons == dataset.completeness.reasons
+    assert run.rows_trained == len(dataset)
+
+
 def test_request_is_validated_before_the_estimator_check() -> None:
     """A malformed request must fail on the data, not on the missing estimator.
 
@@ -246,34 +294,54 @@ def test_run_records_class_counts() -> None:
     assert run.class_counts == {AttackType.BENIGN: 2, AttackType.DOS: 1}
 
 
-def test_training_is_refused_without_an_estimator() -> None:
-    """Training must raise rather than silently do nothing.
+def test_random_forest_training_returns_model_classifier_and_run() -> None:
+    """A real fit must return a model-path classifier and matching metadata."""
+    request = TrainingRequest(dataset=_dataset(), model_name=RANDOM_FOREST_MODEL)
+    classifier, run = train_classifier(request)
 
-    A no-op returning ``None`` would let a caller proceed as though a model had
-    been produced, and the run log would say nothing about it.
-    """
-    request = TrainingRequest(dataset=_dataset(), model_name=DEFAULT_MODEL)
-    with pytest.raises(EstimatorUnavailableError):
-        train_classifier(request)
+    assert classifier.source is ClassifierSource.MODEL
+    assert classifier.feature_order == feature_names()
+    assert run.model_name == RANDOM_FOREST_MODEL
+    assert run.rows_trained == 2
+    assert run.classes == (AttackType.BENIGN, AttackType.DOS)
 
 
-def test_training_refusal_explains_the_rule_fallback_survives() -> None:
-    """The refusal must say the application is unaffected.
+def test_random_forest_probability_columns_cover_trainable_vocabulary() -> None:
+    """Serving must see one probability column per trainable class, in code order."""
+    dataset = _dataset()
+    classifier, _ = train_classifier(
+        TrainingRequest(dataset=dataset, model_name=RANDOM_FOREST_MODEL)
+    )
+    rows = [row.features for row in dataset.examples]
 
-    This is the reassurance an operator needs: declining to train is not an
-    outage, because the rule-based detector still serves every classification.
-    """
+    probabilities = classifier.artifact.estimator.predict_proba(rows)
+
+    assert probabilities.shape == (len(rows), CLASS_COUNT)
+    np.testing.assert_allclose(probabilities.sum(axis=1), np.ones(len(rows)))
+    assert classifier.artifact.metadata.classes == TRAINABLE_ATTACK_TYPES
+
+
+def test_random_forest_training_is_deterministic() -> None:
+    """Repeated runs over unchanged rows must produce identical probabilities."""
+    dataset = _dataset()
+    rows = [row.features for row in dataset.examples]
+    request = TrainingRequest(dataset=dataset, model_name=RANDOM_FOREST_MODEL)
+
+    first, _ = train_classifier(request)
+    second, _ = train_classifier(request)
+
+    np.testing.assert_array_equal(
+        first.artifact.estimator.predict_proba(rows),
+        second.artifact.estimator.predict_proba(rows),
+    )
+
+
+def test_unsupported_estimator_is_refused_with_rule_fallback_noted() -> None:
+    """A model this build cannot fit must fail loudly but leave the rules intact."""
     request = TrainingRequest(dataset=_dataset(), model_name=DEFAULT_MODEL)
     with pytest.raises(EstimatorUnavailableError) as excinfo:
         train_classifier(request)
     assert "rule-based" in str(excinfo.value)
-
-
-def test_training_error_is_an_estimator_error() -> None:
-    """Callers must be able to catch the family."""
-    request = TrainingRequest(dataset=_dataset(), model_name=DEFAULT_MODEL)
-    with pytest.raises(TrainingError):
-        train_classifier(request)
 
 
 def test_no_dataset_means_no_training_data_error() -> None:

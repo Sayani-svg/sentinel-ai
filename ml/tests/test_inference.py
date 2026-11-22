@@ -33,7 +33,6 @@ from src.inference import (
     ModelArtifact,
     ModelArtifactUnavailableError,
     ModelClassifier,
-    SerializationUnavailableError,
     load_artifact,
     select_classifier,
 )
@@ -176,18 +175,15 @@ def test_directory_is_refused(tmp_path: Path) -> None:
         load_artifact(target)
 
 
-def test_present_artifact_without_a_serializer_is_refused(tmp_path: Path) -> None:
-    """A real file must still be refused, naming the missing serializer.
-
-    joblib and pickle are both absent, so there is no honest way to return an
-    estimator in this build.
-    """
+def test_present_but_invalid_artifact_is_refused(tmp_path: Path) -> None:
+    """A non-artifact file must not be served even though joblib is installed."""
     target = tmp_path / "best_model.pkl"
     target.write_bytes(b"not a real artifact")
 
-    with pytest.raises(SerializationUnavailableError) as excinfo:
+    with pytest.raises(ModelArtifactUnavailableError) as excinfo:
         load_artifact(target)
-    assert "serializer" in str(excinfo.value)
+    assert "joblib" in str(excinfo.value)
+    assert "serializer" not in str(excinfo.value)
 
 
 def test_serialization_error_is_an_artifact_error(tmp_path: Path) -> None:
